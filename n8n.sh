@@ -1,14 +1,36 @@
 #!/bin/bash
 
+# ============================================================
+# N8N Management Script with Cloudflare Tunnel Integration
+# ============================================================
+# Requirements:
+#   - Ubuntu/Debian-based Linux (uses apt, dpkg)
+#   - Root/sudo access
+#   - Internet connection
+#   - Cloudflare account with Zero Trust access
+# ============================================================
+
 # === Shell Compatibility Check ===
 if [ -z "$BASH_VERSION" ]; then
     echo "Error: This script requires Bash. Please run with: bash $0" >&2
     exit 1
 fi
 
+# === Check if running as root ===
+if [ "$(id -u)" -ne 0 ]; then
+   echo "This script must be run as root. Please use 'sudo bash $0'" >&2
+   exit 1
+fi
+
+# === Determine the real user and home directory ===
+# When running with sudo, $HOME points to root's home (/root)
+# We need to use the original user's home directory
+REAL_USER="${SUDO_USER:-$(whoami)}"
+REAL_HOME=$(eval echo "~$REAL_USER")
+
 # === Configuration ===
-# N8N Data Directory (relative to the user running the script, e.g., /root/n8n-data if run as root)
-N8N_BASE_DIR="$HOME/n8n" # You can change this path if desired
+# N8N Data Directory (using real user's home, not root's)
+N8N_BASE_DIR="$REAL_HOME/n8n"
 N8N_VOLUME_DIR="$N8N_BASE_DIR/n8n_data"
 DOCKER_COMPOSE_FILE="$N8N_BASE_DIR/docker-compose.yml"
 # Cloudflared config file path
@@ -17,11 +39,11 @@ CLOUDFLARED_CONFIG_FILE="/etc/cloudflared/config.yml"
 DEFAULT_TZ="Asia/Ho_Chi_Minh"
 
 # Backup configuration
-BACKUP_DIR="$HOME/n8n-backups"
+BACKUP_DIR="$REAL_HOME/n8n-backups"
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
 
 # Config file for installation settings
-CONFIG_FILE="$HOME/.n8n_install_config"
+CONFIG_FILE="$REAL_HOME/.n8n_install_config"
 
 # Colors for output
 RED='\033[0;31m'
@@ -150,22 +172,31 @@ get_new_config() {
     
     # Lấy Cloudflare Token
     while true; do
-        read -p "🔑 Nhập Cloudflare Tunnel Token: " CF_TOKEN
+        read -p "🔑 Nhập Cloudflare Tunnel Token (hoặc dòng lệnh cloudflared): " CF_TOKEN
         if [ -z "$CF_TOKEN" ]; then
             print_error "Token không được để trống!"
             continue
         fi
         
-        # Kiểm tra format token (JWT format)
-        if [[ "$CF_TOKEN" =~ ^eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]]; then
+        # Xử lý nếu user paste toàn bộ dòng lệnh: cloudflared.exe service install TOKEN
+        # Hoặc: cloudflared service install TOKEN
+        if [[ "$CF_TOKEN" =~ cloudflared ]]; then
+            # Trích xuất token từ dòng lệnh
+            CF_TOKEN=$(echo "$CF_TOKEN" | grep -oP 'service install \K.*' | tr -d ' ')
+            if [ -z "$CF_TOKEN" ]; then
+                print_error "Không thể trích xuất token từ dòng lệnh. Vui lòng paste lại!"
+                continue
+            fi
+        fi
+        
+        # Kiểm tra format token (JWT format hoặc payload)
+        # Chấp nhận cả token đầy đủ (3 phần) hoặc payload (1 phần)
+        if [[ "$CF_TOKEN" =~ ^eyJ[A-Za-z0-9_-]+ ]]; then
             print_success "Token hợp lệ"
             break
         else
-            print_warning "Token có vẻ không đúng format JWT. Bạn có chắc chắn muốn tiếp tục? (y/N)"
-            read -p "" confirm_token
-            if [ "$confirm_token" = "y" ] || [ "$confirm_token" = "Y" ]; then
-                break
-            fi
+            print_error "Token phải bắt đầu bằng 'eyJ'. Vui lòng kiểm tra lại!"
+            continue
         fi
     done
     
@@ -194,27 +225,8 @@ get_new_config() {
     echo ""
     echo "🔍 Đang phân tích token..."
     
-    # Thử decode JWT token để lấy thông tin
-    TUNNEL_ID=""
-    ACCOUNT_TAG=""
-    TUNNEL_SECRET=""
-    
-    # Decode JWT payload (phần thứ 2)
-    if command -v base64 >/dev/null 2>&1; then
-        TOKEN_PAYLOAD=$(echo "$CF_TOKEN" | cut -d'.' -f2)
-        # Thêm padding nếu cần
-        case $((${#TOKEN_PAYLOAD} % 4)) in
-            2) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}==" ;;
-            3) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}=" ;;
-        esac
-        
-        DECODED=$(echo "$TOKEN_PAYLOAD" | base64 -d 2>/dev/null || echo "")
-        if [ -n "$DECODED" ]; then
-            TUNNEL_ID=$(echo "$DECODED" | grep -o '"t":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-            ACCOUNT_TAG=$(echo "$DECODED" | grep -o '"a":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-            TUNNEL_SECRET=$(echo "$DECODED" | grep -o '"s":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
-        fi
-    fi
+    # Sử dụng hàm helper để decode token
+    decode_token_info "$CF_TOKEN"
     
     if [ -n "$TUNNEL_ID" ]; then
         print_success "Đã phân tích được thông tin từ token:"
@@ -294,6 +306,42 @@ show_detailed_config() {
     fi
 }
 
+decode_token_info() {
+    local token="$1"
+    local tunnel_id=""
+    local account_tag=""
+    local tunnel_secret=""
+    
+    # Decode JWT payload
+    if command -v base64 >/dev/null 2>&1; then
+        # Xác định payload: nếu có dấu chấm thì lấy phần thứ 2, nếu không thì lấy toàn bộ
+        if [[ "$token" == *"."* ]]; then
+            TOKEN_PAYLOAD=$(echo "$token" | cut -d'.' -f2)
+        else
+            # Token chỉ có payload (không có header và signature)
+            TOKEN_PAYLOAD="$token"
+        fi
+        
+        # Thêm padding nếu cần
+        case $((${#TOKEN_PAYLOAD} % 4)) in
+            2) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}==" ;;
+            3) TOKEN_PAYLOAD="${TOKEN_PAYLOAD}=" ;;
+        esac
+        
+        DECODED=$(echo "$TOKEN_PAYLOAD" | base64 -d 2>/dev/null || echo "")
+        if [ -n "$DECODED" ]; then
+            tunnel_id=$(echo "$DECODED" | grep -o '"t":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            account_tag=$(echo "$DECODED" | grep -o '"a":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+            tunnel_secret=$(echo "$DECODED" | grep -o '"s":"[^"]*"' | cut -d'"' -f4 2>/dev/null || echo "")
+        fi
+    fi
+    
+    # Return values via global variables
+    TUNNEL_ID="$tunnel_id"
+    ACCOUNT_TAG="$account_tag"
+    TUNNEL_SECRET="$tunnel_secret"
+}
+
 edit_config() {
     echo "✏️ Chỉnh sửa config:"
     echo ""
@@ -313,6 +361,16 @@ edit_config() {
         
         if [ -n "$new_token" ]; then
             CF_TOKEN="$new_token"
+            # !!! FIX: Gọi lại logic giải mã token để cập nhật thông tin
+            echo "🔍 Phân tích token mới..."
+            decode_token_info "$CF_TOKEN"
+            if [ -n "$TUNNEL_ID" ]; then
+                print_success "Đã phân tích lại token mới:"
+                echo "  🆔 Tunnel ID: $TUNNEL_ID"
+                echo "  🏢 Account Tag: $ACCOUNT_TAG"
+            else
+                print_warning "Không thể phân tích token mới, sẽ sử dụng thông tin cũ"
+            fi
         fi
         
         save_config "$CF_TOKEN" "$CF_HOSTNAME" "$TUNNEL_ID" "$ACCOUNT_TAG" "$TUNNEL_SECRET"
@@ -565,6 +623,11 @@ rollback_backup() {
     fi
     
     echo "🔄 Rollback từ: $(basename "$SELECTED_BACKUP")"
+    echo ""
+    print_warning "⚠️  CẢNH BÁO: Rollback dữ liệu từ một phiên bản n8n cũ có thể gây ra vấn đề tương thích"
+    print_warning "với phiên bản container hiện tại. Cơ sở dữ liệu có thể cần được di chuyển (migrate)."
+    print_warning "Hãy chắc chắn rằng bạn hiểu rõ rủi ro trước khi tiếp tục."
+    echo ""
     read -p "Bạn có chắc chắn muốn rollback? (y/N): " confirm
     
     if [ "$confirm" != "y" ] && [ "$confirm" != "Y" ]; then
@@ -712,7 +775,7 @@ create_backup() {
     tar -czf "$BACKUP_DIR/$BACKUP_FILE" \
         -C "$(dirname "$N8N_BASE_DIR")" "$(basename "$N8N_BASE_DIR")" \
         -C /etc cloudflared/ \
-        -C "$HOME" install_n8n.sh \
+        -C "$(dirname "$0")" "$(basename "$0")" \
         2>/dev/null || true
     
     BACKUP_SIZE=$(du -sh "$BACKUP_DIR/$BACKUP_FILE" | cut -f1)
@@ -825,12 +888,6 @@ backup_and_update() {
 
 # === Original Installation Functions ===
 install_n8n() {
-    # --- Check if running as root ---
-    if [ "$(id -u)" -ne 0 ]; then
-       echo "This script must be run as root. Please use 'sudo ./install_n8n.sh'" >&2
-       exit 1
-    fi
-
     echo -e "${BLUE}================================================${NC}"
     echo -e "${BLUE}    CLOUDFLARE TUNNEL & N8N SETUP${NC}"
     echo -e "${BLUE}================================================${NC}"
@@ -954,8 +1011,9 @@ install_n8n() {
     echo ">>> Setting up n8n data directory: $N8N_BASE_DIR"
     mkdir -p "$N8N_VOLUME_DIR" # Create the specific volume dir as well
     
-    # Set ownership to UID 1000, GID 1000 (standard 'node' user in n8n container)
+    # Set ownership to UID 1000, GID 1000 (standard 'node' user in n8n official container)
     # This prevents permission errors when n8n tries to write data
+    # NOTE: This assumes the official n8n Docker image. Custom images may use different UIDs.
     echo ">>> Setting permissions for n8n data volume..."
     chown -R 1000:1000 "$N8N_VOLUME_DIR"
     
@@ -1013,7 +1071,7 @@ services:
       # N8N_SECURE_COOKIE=false # DO NOT USE THIS when accessing via HTTPS (Cloudflared)
     volumes:
       # Mount the local data directory into the container
-      - ./n8n_local_data:/home/node/.n8n
+      - ./n8n_data:/home/node/.n8n
     healthcheck:
       test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
       interval: 30s
@@ -1027,15 +1085,7 @@ networks:
 
 EOF
     
-    # Save encryption key to secure file for backup purposes
-    echo ">>> Saving encryption key for backup purposes..."
-    echo "# N8N Encryption Key - KEEP THIS SECURE!" > "$N8N_BASE_DIR/.n8n_encryption_key"
-    echo "# Generated on: $(date)" >> "$N8N_BASE_DIR/.n8n_encryption_key"
-    echo "# DO NOT SHARE OR COMMIT TO VERSION CONTROL" >> "$N8N_BASE_DIR/.n8n_encryption_key"
-    echo "N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}" >> "$N8N_BASE_DIR/.n8n_encryption_key"
-    chmod 600 "$N8N_BASE_DIR/.n8n_encryption_key"
-    chown 1000:1000 "$N8N_BASE_DIR/.n8n_encryption_key"
-    
+    # Encryption key đã được lưu ở trên, không cần lưu lại
     print_success "Docker Compose file created with security enhancements"
     print_success "Encryption key saved to: $N8N_BASE_DIR/.n8n_encryption_key"
 
