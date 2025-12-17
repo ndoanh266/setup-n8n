@@ -1,5 +1,11 @@
 #!/bin/bash
 
+# === Shell Compatibility Check ===
+if [ -z "$BASH_VERSION" ]; then
+    echo "Error: This script requires Bash. Please run with: bash $0" >&2
+    exit 1
+fi
+
 # === Configuration ===
 # N8N Data Directory (relative to the user running the script, e.g., /root/n8n-data if run as root)
 N8N_BASE_DIR="$HOME/n8n" # You can change this path if desired
@@ -337,6 +343,104 @@ delete_config() {
 }
 
 # === Utility Functions ===
+check_disk_space() {
+    local required_space_mb="$1"
+    local target_dir="$2"
+    
+    # Lấy dung lượng trống (KB) và chuyển sang MB
+    local available_kb=$(df "$target_dir" | awk 'NR==2 {print $4}')
+    local available_mb=$((available_kb / 1024))
+    
+    if [ $available_mb -lt $required_space_mb ]; then
+        print_error "Không đủ dung lượng! Cần: ${required_space_mb}MB, Có: ${available_mb}MB"
+        return 1
+    else
+        print_success "Dung lượng đủ: ${available_mb}MB khả dụng"
+        return 0
+    fi
+}
+
+validate_encryption_key() {
+    local key="$1"
+    
+    # Kiểm tra key không rỗng
+    if [ -z "$key" ]; then
+        print_error "Encryption key không được để trống!"
+        return 1
+    fi
+    
+    # Kiểm tra độ dài tối thiểu (base64 của 32 bytes = ~44 chars)
+    if [ ${#key} -lt 32 ]; then
+        print_error "Encryption key quá ngắn! Cần ít nhất 32 ký tự"
+        return 1
+    fi
+    
+    # Kiểm tra format base64 (optional - vì có thể dùng plain text)
+    if echo "$key" | base64 -d >/dev/null 2>&1; then
+        print_success "Encryption key hợp lệ (Base64 format)"
+    else
+        print_warning "Encryption key không phải Base64, nhưng vẫn có thể sử dụng"
+    fi
+    
+    return 0
+}
+
+# === Enhanced Utility Functions ===
+
+check_container_health() {
+    local container_name="$1"
+    local max_wait="${2:-60}"
+    local wait_time=0
+    
+    print_section "Kiểm tra sức khỏe container: $container_name"
+    
+    while [ $wait_time -lt $max_wait ]; do
+        local health_status=$(docker inspect --format='{{.State.Health.Status}}' "$container_name" 2>/dev/null || echo "no-healthcheck")
+        
+        case "$health_status" in
+            "healthy")
+                print_success "Container $container_name đang khỏe mạnh"
+                return 0
+                ;;
+            "unhealthy")
+                print_error "Container $container_name không khỏe mạnh"
+                return 1
+                ;;
+            "starting")
+                echo "⏳ Container đang khởi động... ($wait_time/${max_wait}s)"
+                ;;
+            "no-healthcheck")
+                # Fallback: kiểm tra container có đang chạy không
+                if docker ps --format '{{.Names}}' | grep -q "^${container_name}$"; then
+                    print_success "Container $container_name đang chạy (không có healthcheck)"
+                    return 0
+                else
+                    print_error "Container $container_name không chạy"
+                    return 1
+                fi
+                ;;
+        esac
+        
+        sleep 5
+        wait_time=$((wait_time + 5))
+    done
+    
+    print_warning "Timeout khi kiểm tra container health"
+    return 1
+}
+
+backup_encryption_key() {
+    local backup_location="$1"
+    
+    if [ -f "$N8N_ENCRYPTION_KEY_FILE" ]; then
+        cp "$N8N_ENCRYPTION_KEY_FILE" "$backup_location/n8n_encryption_key_backup"
+        chmod 600 "$backup_location/n8n_encryption_key_backup"
+        print_success "Đã backup encryption key"
+    else
+        print_warning "Không tìm thấy encryption key file để backup"
+    fi
+}
+
 cleanup_old_backups() {
     print_section "Dọn dẹp backup cũ"
     
@@ -346,14 +450,20 @@ cleanup_old_backups() {
         # Giữ lại 10 backup gần nhất
         if [ $BACKUP_COUNT -gt 10 ]; then
             echo "🧹 Tìm thấy $BACKUP_COUNT backup, giữ lại 10 backup gần nhất..."
+            
+            # Tính toán dung lượng sẽ được giải phóng
+            local space_to_free=0
             ls -t "$BACKUP_DIR"/*.tar.gz | tail -n +11 | while read old_backup; do
-                echo "  🗑️ Xóa: $(basename "$old_backup")"
+                local file_size=$(du -m "$old_backup" 2>/dev/null | cut -f1)
+                space_to_free=$((space_to_free + file_size))
+                echo "  🗑️ Xóa: $(basename "$old_backup") (${file_size}MB)"
                 rm -f "$old_backup"
                 # Xóa file info tương ứng
                 info_file="${old_backup%.tar.gz}.info"
                 [ -f "$info_file" ] && rm -f "$info_file"
             done
-            print_success "Đã dọn dẹp backup cũ"
+            
+            print_success "Đã dọn dẹp backup cũ, giải phóng ~${space_to_free}MB"
         else
             echo "✅ Số lượng backup ($BACKUP_COUNT) trong giới hạn cho phép"
         fi
@@ -406,7 +516,11 @@ health_check() {
         # Kiểm tra port 5678
         if curl -s -o /dev/null -w "%{http_code}" http://localhost:5678 | grep -q "200\|302\|401"; then
             print_success "N8N service đang hoạt động bình thường"
-            print_success "Truy cập: https://n8n.doanh.id.vn"
+            if [ -n "$CF_HOSTNAME" ]; then
+                print_success "Truy cập: https://$CF_HOSTNAME"
+            else
+                print_success "Truy cập: http://localhost:5678"
+            fi
             return 0
         fi
         
@@ -706,7 +820,7 @@ backup_and_update() {
     echo -e "${GREEN}================================================${NC}"
     print_success "Backup: $BACKUP_DIR/n8n_backup_${TIMESTAMP}.tar.gz"
     print_success "N8N đã được cập nhật và đang chạy"
-    print_success "Truy cập: https://n8n.doanh.id.vn"
+    print_success "Truy cập: https://${CF_HOSTNAME:-localhost:5678}"
 }
 
 # === Original Installation Functions ===
@@ -780,6 +894,9 @@ install_n8n() {
     else
         echo ">>> Docker is already installed."
     fi
+    
+    # Định nghĩa REAL_USER cho tất cả trường hợp (sau khi cài đặt hoặc đã có sẵn)
+    REAL_USER="${SUDO_USER:-$(whoami)}"
 
     # Ensure Docker service is running and enabled
     echo ">>> Ensuring Docker service is running and enabled..."
@@ -836,15 +953,42 @@ install_n8n() {
     # --- Setup n8n Directory and Permissions ---
     echo ">>> Setting up n8n data directory: $N8N_BASE_DIR"
     mkdir -p "$N8N_VOLUME_DIR" # Create the specific volume dir as well
+    
     # Set ownership to UID 1000, GID 1000 (standard 'node' user in n8n container)
     # This prevents permission errors when n8n tries to write data
     echo ">>> Setting permissions for n8n data volume..."
     chown -R 1000:1000 "$N8N_VOLUME_DIR"
+    
+    # Set secure permissions (700 = owner only read/write/execute)
+    # This protects sensitive data like credentials, workflows, and database
+    echo ">>> Setting secure permissions (700) for n8n data..."
+    chmod -R 700 "$N8N_VOLUME_DIR"
 
+    # --- Generate or Load N8N Encryption Key ---
+    N8N_ENCRYPTION_KEY_FILE="$N8N_BASE_DIR/.n8n_encryption_key"
+    
+    if [ -f "$N8N_ENCRYPTION_KEY_FILE" ]; then
+        echo ">>> Loading existing N8N encryption key..."
+        N8N_ENCRYPTION_KEY=$(cat "$N8N_ENCRYPTION_KEY_FILE")
+        print_success "Encryption key loaded from: $N8N_ENCRYPTION_KEY_FILE"
+    else
+        echo ">>> Generating new N8N encryption key..."
+        # Generate a secure random 32-byte key encoded in base64
+        N8N_ENCRYPTION_KEY=$(openssl rand -base64 32 | tr -d '\n')
+        
+        # Save the key securely
+        echo "$N8N_ENCRYPTION_KEY" > "$N8N_ENCRYPTION_KEY_FILE"
+        chmod 600 "$N8N_ENCRYPTION_KEY_FILE"
+        
+        print_success "New encryption key generated and saved to: $N8N_ENCRYPTION_KEY_FILE"
+        print_warning "⚠️  QUAN TRỌNG: Backup file này để có thể restore credentials sau này!"
+    fi
+    
     # --- Create Docker Compose File ---
     echo ">>> Creating Docker Compose file: $DOCKER_COMPOSE_FILE"
     # Determine Timezone
     SYSTEM_TZ=$(cat /etc/timezone 2>/dev/null || echo "$DEFAULT_TZ")
+    
     cat <<EOF > "$DOCKER_COMPOSE_FILE"
 services:
   n8n:
@@ -857,20 +1001,43 @@ services:
     environment:
       # Use system timezone if available, otherwise default
       - TZ=${SYSTEM_TZ}
+      # CRITICAL: Encryption key for credentials - DO NOT CHANGE after first run
+      - N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}
+      # Security settings for HTTPS access via Cloudflare
+      - N8N_HOST=${CF_HOSTNAME}
+      - WEBHOOK_URL=https://${CF_HOSTNAME}/
+      # Performance and security optimizations
+      - N8N_METRICS=false
+      - N8N_DIAGNOSTICS_ENABLED=false
+      - N8N_VERSION_NOTIFICATIONS_ENABLED=false
       # N8N_SECURE_COOKIE=false # DO NOT USE THIS when accessing via HTTPS (Cloudflared)
-      # Add any other specific n8n environment variables here:
-      # - N8N_HOST=$CF_HOSTNAME # Optional: Tell n8n its public hostname
-      # - WEBHOOK_URL=https://$CF_HOSTNAME/ # Optional: Base URL for webhooks
     volumes:
       # Mount the local data directory into the container
       - ./n8n_local_data:/home/node/.n8n
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:5678/healthz || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
 
 networks:
   default:
     name: n8n-network # Define a specific network name (optional but good practice)
 
 EOF
-    echo ">>> Docker Compose file created."
+    
+    # Save encryption key to secure file for backup purposes
+    echo ">>> Saving encryption key for backup purposes..."
+    echo "# N8N Encryption Key - KEEP THIS SECURE!" > "$N8N_BASE_DIR/.n8n_encryption_key"
+    echo "# Generated on: $(date)" >> "$N8N_BASE_DIR/.n8n_encryption_key"
+    echo "# DO NOT SHARE OR COMMIT TO VERSION CONTROL" >> "$N8N_BASE_DIR/.n8n_encryption_key"
+    echo "N8N_ENCRYPTION_KEY=${N8N_ENCRYPTION_KEY}" >> "$N8N_BASE_DIR/.n8n_encryption_key"
+    chmod 600 "$N8N_BASE_DIR/.n8n_encryption_key"
+    chown 1000:1000 "$N8N_BASE_DIR/.n8n_encryption_key"
+    
+    print_success "Docker Compose file created with security enhancements"
+    print_success "Encryption key saved to: $N8N_BASE_DIR/.n8n_encryption_key"
 
     # --- Configure Cloudflared Service ---
     echo ">>> Configuring Cloudflared..."
