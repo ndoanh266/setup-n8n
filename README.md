@@ -18,6 +18,7 @@
 - [🔒 Bảo mật](#-bảo-mật)
 - [❓ FAQ](#-faq)
 - [🤝 Đóng góp](#-đóng-góp)
+- [🙏 Credits](#-credits)
 
 ## 🎯 Dành cho ai?
 
@@ -504,10 +505,18 @@ Nếu script này hữu ích, hãy:
 - ⭐ **Star** repository
 - 🔄 **Share** với bạn bè
 - 💬 **Feedback** để cải thiện
-- ☕ **Buy me a coffee** (optional)
+- ☕ **Buy me a coffee**: VIB 002606 NGUYEN THE DOANH
+
+## 🙏 Credits
+
+Xem [CREDITS.md](CREDITS.md) để biết thêm chi tiết về:
+- 🏢 J2TEAM Community
+- 👨‍💻 Contributors
+- 🛠️ Công nghệ sử dụng
+- 🌍 Cộng đồng hỗ trợ
 
 ---
 
-**Made with ❤️ by Vietnamese Developer Community**
+**Cảm ơn J2TEAM Community đã cho phép chia sẻ**
 
 > 🚀 **Bắt đầu automation journey của bạn ngay hôm nay!**
